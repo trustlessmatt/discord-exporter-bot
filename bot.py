@@ -5,6 +5,8 @@ import os
 import logging
 import re
 import asyncio
+import subprocess
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -22,7 +24,9 @@ class Config:
     discord_token: str
     guild_id: int
     anthropic_api_key: Optional[str] = None
-    obsidian_vault_path: Optional[str] = None
+    dokploy_volume_path: Optional[str] = None
+    github_repo_url: Optional[str] = None
+    github_token: Optional[str] = None
     eastern_tz: ZoneInfo = field(default_factory=lambda: ZoneInfo("America/New_York"))
     digest_model: str = "claude-haiku-4-5-20251001"
     digest_max_tokens: int = 4096
@@ -51,7 +55,9 @@ class Config:
             discord_token=token,
             guild_id=int(guild_id),
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
-            obsidian_vault_path=os.getenv("OBSIDIAN_VAULT_PATH"),
+            dokploy_volume_path=os.getenv("DOKPLOY_VOLUME_PATH"),
+            github_repo_url=os.getenv("GITHUB_REPO_URL"),
+            github_token=os.getenv("GITHUB_TOKEN"),
         )
 
 # =============================================================================
@@ -205,7 +211,7 @@ async def perform_export(bot: commands.Bot, config: Config, hours: int) -> Optio
     logger.info(f"Starting export for last {hours} hours from {guild.name}")
 
     export_time_utc = datetime.now(timezone.utc)
-    export_time_eastern = convert_to_eastern(export_time_utc)
+    export_time_eastern = convert_to_eastern(export_time_utc, config.eastern_tz)
 
     export_data = {
         "guild_name": guild.name,
@@ -325,10 +331,10 @@ Transcript:
 
 def get_output_path(config: Config) -> str:
     """Determine the output path for digests."""
-    if config.obsidian_vault_path and os.path.exists(config.obsidian_vault_path):
-        logger.info(f"Saving to Obsidian vault: {config.obsidian_vault_path}/{config.digests_dir}")
-        return f"{config.obsidian_vault_path}/{config.digests_dir}"
-    logger.info(f"Obsidian vault not found, saving to local: {config.digests_dir}")
+    if config.dokploy_volume_path and os.path.exists(config.dokploy_volume_path):
+        logger.info(f"Saving to dokploy volume: {config.dokploy_volume_path}/{config.digests_dir}")
+        return f"{config.dokploy_volume_path}/{config.digests_dir}"
+    logger.info(f"Dokploy volume not found, saving to local: {config.digests_dir}")
     return config.digests_dir
 
 
@@ -369,8 +375,13 @@ channels: {stats['active_channels']}
 
 
 async def save_to_obsidian(digest_content: str, date_str: str, stats: dict, config: Config) -> str:
-    """Save digest to Obsidian vault or local directory."""
+    """Save digest to local directory and push to GitHub."""
     output_path = get_output_path(config)
+
+    # Initialize git repo if configured
+    if config.github_repo_url:
+        init_git_repo(output_path, config)
+
     os.makedirs(output_path, exist_ok=True)
 
     filename = f"{output_path}/{date_str} - Team Digest.md"
@@ -380,7 +391,121 @@ async def save_to_obsidian(digest_content: str, date_str: str, stats: dict, conf
         f.write(obsidian_content)
 
     logger.info(f"Saved digest to {filename}")
+
+    # Commit and push to GitHub
+    if config.github_repo_url:
+        git_commit_and_push(filename, date_str, config)
+
     return filename
+
+
+def init_git_repo(output_path: str, config: Config) -> bool:
+    """Initialize or clone git repository."""
+    git_dir = os.path.join(output_path, ".git")
+
+    # If .git exists, just pull latest
+    if os.path.exists(git_dir):
+        try:
+            subprocess.run(
+                ["git", "-C", output_path, "pull"],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            logger.info("Git repo updated")
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Git pull failed: {e.stderr}")
+            return False
+
+    # Clone the repo
+    if not config.github_repo_url or not config.github_token:
+        logger.error("GitHub repo URL or token not configured")
+        return False
+
+    # Format: https://TOKEN@github.com/username/repo.git
+    auth_url = config.github_repo_url.replace(
+        "https://",
+        f"https://{config.github_token}@"
+    )
+
+    try:
+        # Clone to temp directory first
+        temp_dir = output_path + "_temp"
+        subprocess.run(
+            ["git", "clone", auth_url, temp_dir],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+
+        # Move .git directory
+        shutil.move(os.path.join(temp_dir, ".git"), output_path)
+        shutil.rmtree(temp_dir)
+
+        logger.info("Git repo cloned successfully")
+        return True
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Git clone failed: {e.stderr}")
+        return False
+
+
+def git_commit_and_push(file_path: str, date_str: str, config: Config) -> bool:
+    """Commit and push the digest file to GitHub."""
+    if not config.github_repo_url or not config.github_token:
+        logger.warning("GitHub not configured, skipping push")
+        return False
+
+    output_path = os.path.dirname(file_path)
+
+    try:
+        # Configure git user (required for commits)
+        subprocess.run(
+            ["git", "-C", output_path, "config", "user.name", "Discord Bot"],
+            check=True,
+            capture_output=True
+        )
+        subprocess.run(
+            ["git", "-C", output_path, "config", "user.email", "bot@discord.local"],
+            check=True,
+            capture_output=True
+        )
+
+        # Add the file
+        subprocess.run(
+            ["git", "-C", output_path, "add", os.path.basename(file_path)],
+            check=True,
+            capture_output=True
+        )
+
+        # Commit
+        commit_message = f"Daily digest for {date_str}"
+        subprocess.run(
+            ["git", "-C", output_path, "commit", "-m", commit_message],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+
+        # Push with authentication
+        auth_url = config.github_repo_url.replace(
+            "https://",
+            f"https://{config.github_token}@"
+        )
+
+        subprocess.run(
+            ["git", "-C", output_path, "push", auth_url, "main"],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+
+        logger.info(f"Successfully pushed {file_path} to GitHub")
+        return True
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Git operation failed: {e.stderr if hasattr(e, 'stderr') else str(e)}")
+        return False
 
 
 # =============================================================================

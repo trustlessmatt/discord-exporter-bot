@@ -1,5 +1,8 @@
 FROM python:3.11-slim
 
+# Install git
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+
 # Set working directory
 WORKDIR /app
 
@@ -10,7 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy bot code
 COPY bot.py .
 
-# Create directories for exports and digests
+# Create directories
 RUN mkdir -p /app/exports /app/digests
 
 # Run the bot
