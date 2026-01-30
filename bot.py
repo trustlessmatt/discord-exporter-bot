@@ -374,7 +374,7 @@ channels: {stats['active_channels']}
 """
 
 
-async def save_to_obsidian(digest_content: str, date_str: str, stats: dict, config: Config) -> str:
+async def save_digest(digest_content: str, date_str: str, stats: dict, config: Config) -> str:
     """Save digest to local directory and push to GitHub."""
     output_path = get_output_path(config)
 
@@ -523,7 +523,7 @@ async def run_digest_pipeline(bot: commands.Bot, config: Config, hours: int) -> 
         return {"success": False, "error": "Failed to generate digest"}
 
     date_str = datetime.now(config.eastern_tz).strftime("%Y-%m-%d")
-    digest_path = await save_to_obsidian(digest, date_str, result["stats"], config)
+    digest_path = await save_digest(digest, date_str, result["stats"], config)
 
     return {
         "success": True,
