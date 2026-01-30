@@ -406,8 +406,16 @@ def init_git_repo(output_path: str, config: Config) -> bool:
     # If .git exists, just pull latest
     if os.path.exists(git_dir):
         try:
+            # First fetch
             subprocess.run(
-                ["git", "-C", output_path, "pull"],
+                ["git", "-C", output_path, "fetch"],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            # Then merge (pull = fetch + merge)
+            subprocess.run(
+                ["git", "-C", output_path, "merge", "origin/main"],
                 check=True,
                 capture_output=True,
                 text=True
@@ -418,7 +426,7 @@ def init_git_repo(output_path: str, config: Config) -> bool:
             logger.error(f"Git pull failed: {e.stderr}")
             return False
 
-    # Clone the repo
+    # Clone the repo for the first time
     if not config.github_repo_url or not config.github_token:
         logger.error("GitHub repo URL or token not configured")
         return False
@@ -430,24 +438,60 @@ def init_git_repo(output_path: str, config: Config) -> bool:
     )
 
     try:
-        # Clone to temp directory first
-        temp_dir = output_path + "_temp"
+        # Create parent directory if it doesn't exist
+        os.makedirs(output_path, exist_ok=True)
+        
+        # Check if directory is empty
+        if os.listdir(output_path):
+            logger.warning(f"Directory {output_path} is not empty, attempting to initialize anyway")
+        
+        # Clone directly into the output path
         subprocess.run(
-            ["git", "clone", auth_url, temp_dir],
+            ["git", "clone", auth_url, output_path],
             check=True,
             capture_output=True,
             text=True
         )
 
-        # Move .git directory
-        shutil.move(os.path.join(temp_dir, ".git"), output_path)
-        shutil.rmtree(temp_dir)
-
         logger.info("Git repo cloned successfully")
         return True
     except subprocess.CalledProcessError as e:
-        logger.error(f"Git clone failed: {e.stderr}")
-        return False
+        # If clone fails because directory exists and has files, try init + remote
+        logger.warning(f"Git clone failed, trying alternative method: {e.stderr}")
+        try:
+            # Initialize git in the directory
+            subprocess.run(
+                ["git", "-C", output_path, "init"],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            # Add remote
+            subprocess.run(
+                ["git", "-C", output_path, "remote", "add", "origin", auth_url],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            # Fetch
+            subprocess.run(
+                ["git", "-C", output_path, "fetch"],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            # Checkout main branch
+            subprocess.run(
+                ["git", "-C", output_path, "checkout", "-b", "main", "origin/main"],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            logger.info("Git repo initialized successfully via alternative method")
+            return True
+        except subprocess.CalledProcessError as e2:
+            logger.error(f"Git initialization failed: {e2.stderr}")
+            return False
 
 
 def git_commit_and_push(file_path: str, date_str: str, config: Config) -> bool:
