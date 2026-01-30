@@ -4,174 +4,189 @@ import json
 import os
 import logging
 import re
+import asyncio
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
+import anthropic
 
+# =============================================================================
+# Configuration
+# =============================================================================
+
+@dataclass
+class Config:
+    """Bot configuration loaded from environment variables."""
+    discord_token: str
+    guild_id: int
+    anthropic_api_key: Optional[str] = None
+    obsidian_vault_path: Optional[str] = None
+    eastern_tz: ZoneInfo = field(default_factory=lambda: ZoneInfo("America/New_York"))
+    digest_model: str = "claude-haiku-4-5-20251001"
+    digest_max_tokens: int = 4096
+    default_hours: int = 24
+    min_hours: int = 1
+    max_hours: int = 720
+    exports_dir: str = "exports"
+    digests_dir: str = "Daily Digests"
+    digest_preview_length: int = 1500
+    scheduled_hour: int = 0  # 12am ET
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        """Load configuration from environment variables."""
+        load_dotenv()
+
+        token = os.getenv("DISCORD_TOKEN")
+        guild_id = os.getenv("GUILD_ID")
+
+        if not token:
+            raise ValueError("DISCORD_TOKEN not found in .env file")
+        if not guild_id:
+            raise ValueError("GUILD_ID not found in .env file")
+
+        return cls(
+            discord_token=token,
+            guild_id=int(guild_id),
+            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
+            obsidian_vault_path=os.getenv("OBSIDIAN_VAULT_PATH"),
+        )
+
+# =============================================================================
 # Set up logging
+# =============================================================================
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# Load environment variables
-load_dotenv()
-TOKEN = os.getenv('DISCORD_TOKEN')
-GUILD_ID = os.getenv('GUILD_ID')
+# =============================================================================
+# Regex patterns (compiled once for performance)
+# =============================================================================
 
-# Timezone configuration
-EASTERN_TZ = ZoneInfo("America/New_York")
+USER_MENTION_PATTERN = re.compile(r"<@!?(\d+)>")
+CHANNEL_MENTION_PATTERN = re.compile(r"<#(\d+)>")
+ROLE_MENTION_PATTERN = re.compile(r"<@&(\d+)>")
 
-# Validate environment variables
-if not TOKEN:
-    raise ValueError("DISCORD_TOKEN not found in .env file")
-if not GUILD_ID:
-    raise ValueError("GUILD_ID not found in .env file")
+# =============================================================================
+# Utility Functions
+# =============================================================================
 
-GUILD_ID = int(GUILD_ID)
-
-# Set up intents
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-
-# Create bot instance
-bot = commands.Bot(command_prefix='!', intents=intents)
-
-def convert_to_eastern(utc_time):
-    """Convert UTC datetime to Eastern Time (handles DST automatically)"""
+def convert_to_eastern(utc_time: datetime, tz: ZoneInfo) -> datetime:
+    """Convert UTC datetime to target timezone (handles DST automatically)."""
     if utc_time.tzinfo is None:
         utc_time = utc_time.replace(tzinfo=timezone.utc)
-    return utc_time.astimezone(EASTERN_TZ)
+    return utc_time.astimezone(tz)
 
-def replace_user_mentions(content, guild):
-    """Replace <@USER_ID> mentions with @username"""
+
+def replace_mention(pattern: re.Pattern, content: str, guild, resolver) -> str:
+    """Generic function to replace Discord mentions with readable text."""
     if not content:
         return content
-    
-    # Regex to match <@USER_ID> or <@!USER_ID>
-    mention_pattern = r'<@!?(\d+)>'
-    
-    def replace_mention(match):
-        user_id = int(match.group(1))
-        member = guild.get_member(user_id)
-        if member:
-            return f"@{member.name}"
-        return match.group(0)  # Keep original if user not found
-    
-    return re.sub(mention_pattern, replace_mention, content)
 
-def replace_channel_mentions(content, guild):
-    """Replace <#CHANNEL_ID> mentions with #channel-name"""
-    if not content:
-        return content
-    
-    channel_pattern = r'<#(\d+)>'
-    
-    def replace_channel(match):
-        channel_id = int(match.group(1))
-        channel = guild.get_channel(channel_id)
-        if channel:
-            return f"#{channel.name}"
+    def replace(match):
+        entity_id = int(match.group(1))
+        entity = resolver(entity_id)
+        if entity:
+            prefix = "@" if pattern in (USER_MENTION_PATTERN, ROLE_MENTION_PATTERN) else "#"
+            return f"{prefix}{entity.name}"
         return match.group(0)
-    
-    return re.sub(channel_pattern, replace_channel, content)
 
-def replace_role_mentions(content, guild):
-    """Replace <@&ROLE_ID> mentions with @role-name"""
-    if not content:
-        return content
-    
-    role_pattern = r'<@&(\d+)>'
-    
-    def replace_role(match):
-        role_id = int(match.group(1))
-        role = guild.get_role(role_id)
-        if role:
-            return f"@{role.name}"
-        return match.group(0)
-    
-    return re.sub(role_pattern, replace_role, content)
+    return pattern.sub(replace, content)
 
-def clean_content(content, guild):
-    """Replace all Discord mentions with readable text"""
-    content = replace_user_mentions(content, guild)
-    content = replace_channel_mentions(content, guild)
-    content = replace_role_mentions(content, guild)
+
+def clean_content(content: str, guild) -> str:
+    """Replace all Discord mentions with readable text."""
+    content = replace_mention(USER_MENTION_PATTERN, content, guild, guild.get_member)
+    content = replace_mention(CHANNEL_MENTION_PATTERN, content, guild, guild.get_channel)
+    content = replace_mention(ROLE_MENTION_PATTERN, content, guild, guild.get_role)
     return content
 
-@bot.event
-async def on_ready():
-    logger.info(f'{bot.user} has connected to Discord!')
-    logger.info(f'Bot is in {len(bot.guilds)} guild(s)')
-    
-    guild = bot.get_guild(GUILD_ID)
-    if guild:
-        logger.info(f'Connected to: {guild.name}')
-        logger.info(f'Text channels: {len(guild.text_channels)}')
-        for channel in guild.text_channels:
-            logger.info(f'  - {channel.name}')
 
-async def export_channel_messages(channel, hours=24):
-    """Export messages from a channel within the last X hours"""
+def serialize_message(message, guild, config: Config) -> dict:
+    """Convert a Discord message to a serializable dictionary."""
+    eastern_time = convert_to_eastern(message.created_at, config.eastern_tz)
+    edited_eastern = convert_to_eastern(message.edited_at, config.eastern_tz) if message.edited_at else None
+
+    return {
+        "message_id": str(message.id),
+        "author": {
+            "name": message.author.name,
+            "display_name": message.author.display_name,
+            "id": str(message.author.id),
+            "bot": message.author.bot
+        },
+        "content": message.content,
+        "content_clean": clean_content(message.content, guild),
+        "timestamp": eastern_time.isoformat(),
+        "timestamp_utc": message.created_at.isoformat(),
+        "edited_timestamp": edited_eastern.isoformat() if edited_eastern else None,
+        "attachments": [
+            {"filename": att.filename, "url": att.url, "size": att.size}
+            for att in message.attachments
+        ],
+        "embeds": len(message.embeds),
+        "reactions": [
+            {"emoji": str(reaction.emoji), "count": reaction.count}
+            for reaction in message.reactions
+        ],
+        "mentions": [
+            {"id": str(user.id), "name": user.name, "display_name": user.display_name}
+            for user in message.mentions
+        ],
+        "channel_mentions": [
+            {"id": str(ch.id), "name": ch.name}
+            for ch in message.channel_mentions
+        ],
+        "thread": message.thread.name if hasattr(message, "thread") and message.thread else None
+    }
+
+
+def calculate_export_stats(export_data: dict) -> dict:
+    """Calculate statistics from export data."""
+    total_messages = sum(len(ch["messages"]) for ch in export_data["channels"].values())
+    active_channels = len(export_data["channels"])
+
+    contributors = {
+        msg["author"]["display_name"]
+        for channel_data in export_data["channels"].values()
+        for msg in channel_data["messages"]
+        if not msg["author"]["bot"]
+    }
+
+    return {
+        "total_messages": total_messages,
+        "active_channels": active_channels,
+        "contributors": contributors,
+        "contributor_count": len(contributors)
+    }
+
+
+def filter_bot_messages(messages: list) -> list:
+    """Filter out messages from bots."""
+    return [m for m in messages if not m["author"]["bot"]]
+
+# =============================================================================
+# Core Export Functions
+# =============================================================================
+
+async def export_channel_messages(channel, hours: int, config: Config) -> list:
+    """Export messages from a channel within the last X hours."""
     cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours)
     messages_data = []
     guild = channel.guild
-    
+
     try:
         async for message in channel.history(limit=None, after=cutoff_time):
-            # Convert timestamp to Eastern Time
-            eastern_time = convert_to_eastern(message.created_at)
-            edited_eastern = convert_to_eastern(message.edited_at) if message.edited_at else None
-            
-            message_data = {
-                "message_id": str(message.id),
-                "author": {
-                    "name": message.author.name,
-                    "display_name": message.author.display_name,
-                    "id": str(message.author.id),
-                    "bot": message.author.bot
-                },
-                "content": message.content,  # Original with Discord formatting
-                "content_clean": clean_content(message.content, guild),  # Readable version
-                "timestamp": eastern_time.isoformat(),  # Eastern Time
-                "timestamp_utc": message.created_at.isoformat(),  # Keep UTC for reference
-                "edited_timestamp": edited_eastern.isoformat() if edited_eastern else None,
-                "attachments": [
-                    {
-                        "filename": att.filename,
-                        "url": att.url,
-                        "size": att.size
-                    } for att in message.attachments
-                ],
-                "embeds": len(message.embeds),
-                "reactions": [
-                    {
-                        "emoji": str(reaction.emoji),
-                        "count": reaction.count
-                    } for reaction in message.reactions
-                ],
-                "mentions": [
-                    {
-                        "id": str(user.id),
-                        "name": user.name,
-                        "display_name": user.display_name
-                    } for user in message.mentions
-                ],
-                "channel_mentions": [
-                    {
-                        "id": str(ch.id),
-                        "name": ch.name
-                    } for ch in message.channel_mentions
-                ],
-                "thread": message.thread.name if hasattr(message, 'thread') and message.thread else None
-            }
-            messages_data.append(message_data)
-        
+            messages_data.append(serialize_message(message, guild, config))
+
         logger.info(f"Exported {len(messages_data)} messages from #{channel.name}")
         return messages_data
-    
+
     except discord.Forbidden:
         logger.warning(f"No permission to read #{channel.name}")
         return []
@@ -179,18 +194,19 @@ async def export_channel_messages(channel, hours=24):
         logger.error(f"Error exporting #{channel.name}: {e}")
         return []
 
-async def perform_export(hours=24, output_dir="exports"):
-    """Perform the export operation - can be called by commands or scheduled tasks"""
-    guild = bot.get_guild(GUILD_ID)
+
+async def perform_export(bot: commands.Bot, config: Config, hours: int) -> Optional[dict]:
+    """Perform the export operation across all channels concurrently."""
+    guild = bot.get_guild(config.guild_id)
     if not guild:
-        logger.error(f"Guild with ID {GUILD_ID} not found")
+        logger.error(f"Guild with ID {config.guild_id} not found")
         return None
-    
+
     logger.info(f"Starting export for last {hours} hours from {guild.name}")
-    
+
     export_time_utc = datetime.now(timezone.utc)
     export_time_eastern = convert_to_eastern(export_time_utc)
-    
+
     export_data = {
         "guild_name": guild.name,
         "export_time_eastern": export_time_eastern.isoformat(),
@@ -199,57 +215,310 @@ async def perform_export(hours=24, output_dir="exports"):
         "time_range_hours": hours,
         "channels": {}
     }
-    
-    for channel in guild.text_channels:
-        messages = await export_channel_messages(channel, hours)
+
+    # Export all channels concurrently for better performance
+    tasks_list = [export_channel_messages(ch, hours, config) for ch in guild.text_channels]
+    results = await asyncio.gather(*tasks_list)
+
+    for channel, messages in zip(guild.text_channels, results):
         if messages:
             export_data["channels"][channel.name] = {
                 "channel_id": str(channel.id),
                 "messages": messages
             }
-    
-    # Save to JSON with Eastern timestamp in filename
-    filename = f"{output_dir}/discord_export_{export_time_eastern.strftime('%Y%m%d_%H%M%S')}_ET.json"
-    os.makedirs(output_dir, exist_ok=True)
-    
+
+    # Save to JSON
+    filename = f"{config.exports_dir}/discord_export_{export_time_eastern.strftime('%Y%m%d_%H%M%S')}_ET.json"
+    os.makedirs(config.exports_dir, exist_ok=True)
+
     try:
-        with open(filename, 'w', encoding='utf-8') as f:
+        with open(filename, "w", encoding="utf-8") as f:
             json.dump(export_data, f, indent=2, ensure_ascii=False)
-        
-        total_messages = sum(len(ch["messages"]) for ch in export_data["channels"].values())
-        logger.info(f"Export complete: {total_messages} messages from {len(export_data['channels'])} channels")
-        
+
+        stats = calculate_export_stats(export_data)
+        logger.info(f"Export complete: {stats['total_messages']} messages from {stats['active_channels']} channels")
+
         return {
             "filename": filename,
-            "total_messages": total_messages,
-            "channel_count": len(export_data["channels"]),
-            "export_data": export_data
+            "total_messages": stats["total_messages"],
+            "channel_count": stats["active_channels"],
+            "export_data": export_data,
+            "stats": stats
         }
     except Exception as e:
         logger.error(f"Error saving export: {e}")
         return None
 
-@bot.command(name='export')
-async def export_now(ctx, hours: int = 24):
-    """Manually trigger export of last X hours"""
-    if hours < 1 or hours > 720:  # Max 30 days
-        await ctx.send("Hours must be between 1 and 720 (30 days)")
+
+# =============================================================================
+# Claude Anthropic Integration
+# =============================================================================
+
+def get_anthropic_client(api_key: str) -> anthropic.Anthropic:
+    """Get or create Anthropic client (reusable)."""
+    return anthropic.Anthropic(api_key=api_key)
+
+
+def prepare_transcript(export_data: dict) -> str:
+    """Prepare transcript for Claude analysis from export data."""
+    channel_summaries = []
+
+    for channel_name, channel_data in export_data["channels"].items():
+        non_bot_messages = filter_bot_messages(channel_data["messages"])
+        if not non_bot_messages:
+            continue
+
+        messages_text = "\n".join([
+            f"[{msg['timestamp'][:19]}] {msg['author']['display_name']}: {msg['content_clean']}"
+            for msg in non_bot_messages
+        ])
+
+        channel_summaries.append(f"## Channel: #{channel_name}\n{messages_text}\n")
+
+    return "\n".join(channel_summaries) if channel_summaries else "No messages to analyze."
+
+
+async def generate_daily_digest(export_data: dict, config: Config) -> Optional[str]:
+    """Use Claude to generate structured daily digest."""
+    if not config.anthropic_api_key:
+        logger.error("ANTHROPIC_API_KEY not set")
+        return None
+
+    transcript = prepare_transcript(export_data)
+
+    try:
+        client = get_anthropic_client(config.anthropic_api_key)
+
+        prompt = f"""Analyze this Discord transcript from the last 24 hours and create a structured daily digest for a team manager.
+
+Focus on extracting:
+
+1. **Individual Updates** - What each team member worked on, completed, or made progress on
+2. **Upcoming Work** - What team members mentioned they're planning to work on next
+3. **Blockers & Challenges** - Any obstacles, issues, or requests for help
+4. **Key Decisions & Ideas** - Important discussions, decisions made, or ideas that shouldn't be lost
+5. **Action Items** - Specific TODOs or follow-ups mentioned
+
+Be concise but don't lose important technical details. Organize by person where possible.
+If there's very little activity, just note that briefly.
+
+Transcript:
+{transcript}
+"""
+
+        message = client.messages.create(
+            model=config.digest_model,
+            max_tokens=config.digest_max_tokens,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        return message.content[0].text
+
+    except Exception as e:
+        logger.error(f"Error calling Claude API: {e}")
+        return None
+
+
+# =============================================================================
+# Obsidian/Markdown Output
+# =============================================================================
+
+def get_output_path(config: Config) -> str:
+    """Determine the output path for digests."""
+    if config.obsidian_vault_path and os.path.exists(config.obsidian_vault_path):
+        logger.info(f"Saving to Obsidian vault: {config.obsidian_vault_path}/{config.digests_dir}")
+        return f"{config.obsidian_vault_path}/{config.digests_dir}"
+    logger.info(f"Obsidian vault not found, saving to local: {config.digests_dir}")
+    return config.digests_dir
+
+
+def format_obsidian_document(date_str: str, digest_content: str, stats: dict, config: Config) -> str:
+    """Create Obsidian-formatted document."""
+    prev_day = (datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+    next_day = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    return f"""---
+date: {date_str}
+type: daily-digest
+tags: [team, standup, daily]
+contributors: {stats['contributor_count']}
+messages: {stats['total_messages']}
+channels: {stats['active_channels']}
+---
+
+# Team Digest - {date_str}
+
+**📊 Activity Summary**
+- {stats['total_messages']} messages across {stats['active_channels']} channels
+- {stats['contributor_count']} active team members
+- Time range: Last 24 hours
+
+---
+
+{digest_content}
+
+---
+
+**🔗 Links**
+- [[{prev_day} - Team Digest|← Previous Day]]
+- [[{next_day} - Team Digest|Next Day →]]
+
+---
+*Auto-generated at {datetime.now(config.eastern_tz).strftime('%I:%M %p ET')} from Discord*
+"""
+
+
+async def save_to_obsidian(digest_content: str, date_str: str, stats: dict, config: Config) -> str:
+    """Save digest to Obsidian vault or local directory."""
+    output_path = get_output_path(config)
+    os.makedirs(output_path, exist_ok=True)
+
+    filename = f"{output_path}/{date_str} - Team Digest.md"
+    obsidian_content = format_obsidian_document(date_str, digest_content, stats, config)
+
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(obsidian_content)
+
+    logger.info(f"Saved digest to {filename}")
+    return filename
+
+
+# =============================================================================
+# Digest Pipeline (reusable)
+# =============================================================================
+
+async def run_digest_pipeline(bot: commands.Bot, config: Config, hours: int) -> Optional[dict]:
+    """Run the complete digest pipeline: export, analyze, save."""
+    result = await perform_export(bot, config, hours)
+    if not result:
+        return {"success": False, "error": "Export failed"}
+
+    digest = await generate_daily_digest(result["export_data"], config)
+    if not digest:
+        return {"success": False, "error": "Failed to generate digest"}
+
+    date_str = datetime.now(config.eastern_tz).strftime("%Y-%m-%d")
+    digest_path = await save_to_obsidian(digest, date_str, result["stats"], config)
+
+    return {
+        "success": True,
+        "digest": digest,
+        "digest_path": digest_path,
+        "stats": result["stats"],
+        "export_filename": result["filename"]
+    }
+
+
+# =============================================================================
+# Discord Bot Setup
+# =============================================================================
+
+config = Config.from_env()
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+@bot.event
+async def on_ready():
+    logger.info(f"{bot.user} has connected to Discord!")
+    logger.info(f"Bot is in {len(bot.guilds)} guild(s)")
+
+    guild = bot.get_guild(config.guild_id)
+    if guild:
+        logger.info(f"Connected to: {guild.name}")
+        logger.info(f"Text channels: {len(guild.text_channels)}")
+        for channel in guild.text_channels:
+            logger.info(f"  - {channel.name}")
+
+    if not daily_digest_task.is_running():
+        daily_digest_task.start()
+        logger.info("Daily digest task started")
+
+
+@bot.command(name="export")
+async def export_now(ctx, hours: int = None):
+    """Manually trigger export of last X hours."""
+    hours = hours or config.default_hours
+    if hours < config.min_hours or hours > config.max_hours:
+        await ctx.send(f"Hours must be between {config.min_hours} and {config.max_hours} (30 days)")
         return
-    
-    await ctx.send(f'Starting export of last {hours} hours...')
-    
-    result = await perform_export(hours)
-    
+
+    await ctx.send(f"Starting export of last {hours} hours...")
+
+    result = await perform_export(bot, config, hours)
+
     if result:
         await ctx.send(
-            f'✅ Export complete!\n'
-            f'• {result["total_messages"]} messages\n'
-            f'• {result["channel_count"]} channels\n'
-            f'• Saved to `{result["filename"]}`'
+            f"✅ Export complete!\n"
+            f"• {result['total_messages']} messages\n"
+            f"• {result['channel_count']} channels\n"
+            f"• Saved to `{result['filename']}`"
         )
     else:
-        await ctx.send('❌ Export failed. Check the logs for details.')
+        await ctx.send("❌ Export failed. Check the logs for details.")
 
-# Run the bot
+
+@bot.command(name="digest")
+async def generate_digest_command(ctx, hours: int = None):
+    """Generate AI-powered daily digest from Discord activity."""
+    hours = hours or config.default_hours
+    if hours < config.min_hours or hours > config.max_hours:
+        await ctx.send(f"Hours must be between {config.min_hours} and {config.max_hours} (30 days)")
+        return
+
+    await ctx.send(f"🤖 Generating digest for last {hours} hours...")
+
+    result = await run_digest_pipeline(bot, config, hours)
+
+    if result["success"]:
+        preview = result["digest"]
+        if len(preview) > config.digest_preview_length:
+            preview = preview[:config.digest_preview_length] + "..."
+
+        await ctx.send(
+            f"✅ **Daily Digest Generated**\n\n{preview}\n\n"
+            f"📁 Full digest: `{result['digest_path']}`"
+        )
+    else:
+        await ctx.send(f"❌ {result['error']}. Check the logs for details.")
+
+
+@tasks.loop(hours=24)
+async def daily_digest_task():
+    """Automatically generate daily digest at scheduled time."""
+    logger.info("Running scheduled daily digest")
+
+    result = await run_digest_pipeline(bot, config, config.default_hours)
+
+    if result["success"]:
+        logger.info("✅ Daily digest completed successfully")
+    else:
+        logger.error(f"Daily digest failed: {result.get('error', 'Unknown error')}")
+
+
+@daily_digest_task.before_loop
+async def before_daily_digest():
+    """Wait until scheduled time to start the loop."""
+    await bot.wait_until_ready()
+
+    now = datetime.now(config.eastern_tz)
+    target_time = now.replace(hour=config.scheduled_hour, minute=0, second=0, microsecond=0)
+
+    if now.time() >= target_time.time():
+        target_time += timedelta(days=1)
+
+    wait_seconds = (target_time - now).total_seconds()
+    logger.info(f"⏰ Waiting {wait_seconds/3600:.1f} hours until first digest at {config.scheduled_hour}:00am ET")
+    await asyncio.sleep(wait_seconds)
+
+
+# =============================================================================
+# Main Entry Point
+# =============================================================================
+
 if __name__ == "__main__":
-    bot.run(TOKEN)
+    bot.run(config.discord_token)
