@@ -343,6 +343,10 @@ def format_obsidian_document(date_str: str, digest_content: str, stats: dict, co
     prev_day = (datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
     next_day = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
 
+    # Include year-month folder in wikilinks
+    prev_year_month = prev_day[:7]
+    next_year_month = next_day[:7]
+
     return f"""---
 date: {date_str}
 type: daily-digest
@@ -366,8 +370,8 @@ channels: {stats['active_channels']}
 ---
 
 **🔗 Links**
-- [[{prev_day} - Team Digest|← Previous Day]]
-- [[{next_day} - Team Digest|Next Day →]]
+- [[{prev_year_month}/{prev_day} - Team Digest|← Previous Day]]
+- [[{next_year_month}/{next_day} - Team Digest|Next Day →]]
 
 ---
 *Auto-generated at {datetime.now(config.eastern_tz).strftime('%I:%M %p ET')} from Discord*
@@ -375,16 +379,24 @@ channels: {stats['active_channels']}
 
 
 async def save_digest(digest_content: str, date_str: str, stats: dict, config: Config) -> str:
-    """Save digest to local directory and push to GitHub."""
+    """Save digest to local directory and push to GitHub.
+
+    Files are organized into month-year folders (e.g., 2026-02/).
+    """
     output_path = get_output_path(config)
 
     # Initialize git repo if configured
     if config.github_repo_url:
         init_git_repo(output_path, config)
 
-    os.makedirs(output_path, exist_ok=True)
+    # Extract year-month from date_str (YYYY-MM-DD -> YYYY-MM)
+    year_month = date_str[:7]  # "2026-02"
+    month_folder = f"{output_path}/{year_month}"
 
-    filename = f"{output_path}/{date_str} - Team Digest.md"
+    # Create month folder if it doesn't exist
+    os.makedirs(month_folder, exist_ok=True)
+
+    filename = f"{month_folder}/{date_str} - Team Digest.md"
     obsidian_content = format_obsidian_document(date_str, digest_content, stats, config)
 
     with open(filename, "w", encoding="utf-8") as f:
@@ -500,7 +512,8 @@ def git_commit_and_push(file_path: str, date_str: str, config: Config) -> bool:
         logger.warning("GitHub not configured, skipping push")
         return False
 
-    output_path = os.path.dirname(file_path)
+    # Get the repo root (two levels up from file: file is in YYYY-MM/ subfolder)
+    output_path = os.path.dirname(os.path.dirname(file_path))
 
     try:
         # Configure git user (required for commits)
@@ -515,9 +528,12 @@ def git_commit_and_push(file_path: str, date_str: str, config: Config) -> bool:
             capture_output=True
         )
 
-        # Add the file
+        # Get the relative path from repo root (e.g., "2026-02/2026-02-23 - Team Digest.md")
+        relative_path = os.path.relpath(file_path, output_path)
+
+        # Add the file using relative path
         subprocess.run(
-            ["git", "-C", output_path, "add", os.path.basename(file_path)],
+            ["git", "-C", output_path, "add", relative_path],
             check=True,
             capture_output=True
         )
