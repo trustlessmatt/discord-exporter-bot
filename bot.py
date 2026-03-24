@@ -2,6 +2,7 @@ import discord
 from discord.ext import commands, tasks
 import json
 import os
+import glob
 import logging
 import re
 import asyncio
@@ -28,8 +29,8 @@ class Config:
     github_repo_url: Optional[str] = None
     github_token: Optional[str] = None
     eastern_tz: ZoneInfo = field(default_factory=lambda: ZoneInfo("America/New_York"))
-    digest_model: str = "claude-haiku-4-5-20251001"
-    digest_max_tokens: int = 4096
+    digest_model: str = "claude-sonnet-4-6"
+    digest_max_tokens: int = 8192
     default_hours: int = 24
     min_hours: int = 1
     max_hours: int = 720
@@ -284,7 +285,7 @@ def prepare_transcript(export_data: dict) -> str:
     return "\n".join(channel_summaries) if channel_summaries else "No messages to analyze."
 
 
-async def generate_daily_digest(export_data: dict, config: Config) -> Optional[str]:
+async def generate_daily_digest(export_data: dict, config: Config, brain_context: Optional[str] = None) -> Optional[str]:
     """Use Claude to generate structured daily digest."""
     if not config.anthropic_api_key:
         logger.error("ANTHROPIC_API_KEY not set")
@@ -295,10 +296,12 @@ async def generate_daily_digest(export_data: dict, config: Config) -> Optional[s
     try:
         client = get_anthropic_client(config.anthropic_api_key)
 
-        prompt = f"""Analyze this Discord transcript from the last 24 hours and create a structured daily digest for a team manager.
+        system_prompt = "You are an assistant that generates daily team digests for a product manager.\n\n"
 
-Focus on extracting:
+        if brain_context:
+            system_prompt += f"<project-context>\n{brain_context}\n</project-context>\n\n"
 
+        system_prompt += """When analyzing the transcript:
 1. **Individual Updates** - What each team member worked on, completed, or made progress on
 2. **Upcoming Work** - What team members mentioned they're planning to work on next
 3. **Blockers & Challenges** - Any obstacles, issues, or requests for help
@@ -306,16 +309,16 @@ Focus on extracting:
 5. **Action Items** - Specific TODOs or follow-ups mentioned
 
 Be concise but don't lose important technical details. Organize by person where possible.
-If there's very little activity, just note that briefly.
+If there's very little activity, just note that briefly."""
 
-Transcript:
-{transcript}
-"""
+        if brain_context:
+            system_prompt += "\n\nUse the project context to relate work to known product areas, use correct terminology and team member names, and flag progress on known initiatives."
 
         message = client.messages.create(
             model=config.digest_model,
             max_tokens=config.digest_max_tokens,
-            messages=[{"role": "user", "content": prompt}]
+            system=system_prompt,
+            messages=[{"role": "user", "content": f"Discord transcript from the last 24 hours:\n\n{transcript}"}]
         )
 
         return message.content[0].text
@@ -323,6 +326,40 @@ Transcript:
     except Exception as e:
         logger.error(f"Error calling Claude API: {e}")
         return None
+
+
+def load_brain_context(repo_root: str) -> Optional[str]:
+    """Load curated context files from the coordinator-brain repo."""
+    context_files = [
+        ("Project Context", [os.path.join(repo_root, "CONTEXT.md")]),
+        ("Team Members", sorted(glob.glob(os.path.join(repo_root, "people", "*.md")))),
+        ("Product Overview", [
+            os.path.join(repo_root, "COORDINATOR", "COORDINATOR.md"),
+        ]),
+    ]
+
+    sections = []
+    for section_title, paths in context_files:
+        section_parts = []
+        for path in paths:
+            if not os.path.exists(path):
+                logger.warning(f"Brain context file not found: {path}")
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    section_parts.append(f.read().strip())
+            except OSError as e:
+                logger.warning(f"Could not read brain context file {path}: {e}")
+
+        if section_parts:
+            sections.append(f"## {section_title}\n\n" + "\n\n---\n\n".join(section_parts))
+
+    if not sections:
+        logger.warning("No brain context files loaded — digests will have no project context")
+        return None
+
+    logger.info(f"Loaded brain context from {repo_root} ({len(sections)} section(s))")
+    return "\n\n".join(sections)
 
 
 # =============================================================================
@@ -378,20 +415,20 @@ channels: {stats['active_channels']}
 """
 
 
-async def save_digest(digest_content: str, date_str: str, stats: dict, config: Config) -> str:
+async def save_digest(digest_content: str, date_str: str, stats: dict, config: Config, output_path: Optional[str] = None) -> str:
     """Save digest to local directory and push to GitHub.
 
     Files are organized into month-year folders (e.g., 2026-02/).
     """
-    output_path = get_output_path(config)
-
-    # Initialize git repo if configured
-    if config.github_repo_url:
-        init_git_repo(output_path, config)
+    if output_path is None:
+        output_path = get_output_path(config)
+        # Initialize git repo if configured (only when not pre-initialized by pipeline)
+        if config.github_repo_url:
+            init_git_repo(output_path, config)
 
     # Extract year-month from date_str (YYYY-MM-DD -> YYYY-MM)
     year_month = date_str[:7]  # "2026-02"
-    month_folder = f"{output_path}/{year_month}"
+    month_folder = f"{output_path}/daily-digest/{year_month}"
 
     # Create month folder if it doesn't exist
     os.makedirs(month_folder, exist_ok=True)
@@ -406,7 +443,7 @@ async def save_digest(digest_content: str, date_str: str, stats: dict, config: C
 
     # Commit and push to GitHub
     if config.github_repo_url:
-        git_commit_and_push(filename, date_str, config)
+        git_commit_and_push(filename, output_path, date_str, config)
 
     return filename
 
@@ -506,14 +543,13 @@ def init_git_repo(output_path: str, config: Config) -> bool:
             return False
 
 
-def git_commit_and_push(file_path: str, date_str: str, config: Config) -> bool:
+def git_commit_and_push(file_path: str, repo_root: str, date_str: str, config: Config) -> bool:
     """Commit and push the digest file to GitHub."""
     if not config.github_repo_url or not config.github_token:
         logger.warning("GitHub not configured, skipping push")
         return False
 
-    # Get the repo root (two levels up from file: file is in YYYY-MM/ subfolder)
-    output_path = os.path.dirname(os.path.dirname(file_path))
+    output_path = repo_root
 
     try:
         # Configure git user (required for commits)
@@ -574,16 +610,23 @@ def git_commit_and_push(file_path: str, date_str: str, config: Config) -> bool:
 
 async def run_digest_pipeline(bot: commands.Bot, config: Config, hours: int) -> Optional[dict]:
     """Run the complete digest pipeline: export, analyze, save."""
+    # Initialize git repo first so brain context is available before calling Claude
+    output_path = get_output_path(config)
+    if config.github_repo_url:
+        init_git_repo(output_path, config)
+
+    brain_context = load_brain_context(output_path)
+
     result = await perform_export(bot, config, hours)
     if not result:
         return {"success": False, "error": "Export failed"}
 
-    digest = await generate_daily_digest(result["export_data"], config)
+    digest = await generate_daily_digest(result["export_data"], config, brain_context)
     if not digest:
         return {"success": False, "error": "Failed to generate digest"}
 
     date_str = datetime.now(config.eastern_tz).strftime("%Y-%m-%d")
-    digest_path = await save_digest(digest, date_str, result["stats"], config)
+    digest_path = await save_digest(digest, date_str, result["stats"], config, output_path)
 
     return {
         "success": True,
